@@ -8,14 +8,14 @@
 
 [[func]]
 name = "I_RESET"
-addr = "ffff"
+addr = "8004"
 bank = 0
 emit = false
 note = "Emulation RESET vector ($FFFC)"
 
 [[func]]
 name = "I_NMI"
-addr = "ffff"
+addr = "81b1"
 bank = 0
 emit = false
 note = "Native NMI vector ($FFEA)"

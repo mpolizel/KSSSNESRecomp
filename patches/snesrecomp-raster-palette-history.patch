@@ -1,0 +1,130 @@
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index 80d52f52..7760c4e4 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -3276,6 +3276,17 @@ typedef struct {
+   uint16_t oam[0x100];
+   uint8_t highOam[0x20];
+ } PpuRasterOam;
++/* CGRAM contents from a beam position on, kept the same way. A game may
++ * reload palettes mid-field: Kirby Super Star's IRQ at line 168 DMAs the HUD
++ * palettes over BG palettes 0-7 for the status bar, and its NMI puts the
++ * stage palettes back. Drawn with the CGRAM left at the end of the field, the
++ * whole stage took the HUD's colors. HDMA writes are not recorded here: the
++ * render loop replays HDMA itself. */
++#define PPU_RASTER_CG_MAX 8
++typedef struct {
++  uint16_t key;
++  uint16_t cgram[0x100];
++} PpuRasterCg;
+ typedef struct {
+   uint8_t regs[PPU_SAVESTATE_REGS_SIZE];   /* inidisp..cgwsel at field start */
+   uint8_t scrollPrev, scrollPrev2, m7prev;
+@@ -3289,6 +3300,11 @@ typedef struct {
+   int oamOpen;                             /* last snapshot still filling */
+   uint32_t oamDropped;
+   PpuRasterOam oamSnap[PPU_RASTER_OAM_MAX];
++  uint16_t cgBase[0x100];                  /* CGRAM at field start */
++  int cgCount;
++  int cgOpen;
++  uint32_t cgDropped;
++  PpuRasterCg cgSnap[PPU_RASTER_CG_MAX];
+ } PpuRasterField;
+ static PpuRasterField s_field[2];
+ static int s_raster_cur;             /* recording; the other is completed */
+@@ -3305,6 +3321,8 @@ static struct {
+ static int s_raster_oam_next;
+ static uint16_t s_raster_live_oam[0x100];  /* the guest's OAM during a render */
+ static uint8_t s_raster_live_high_oam[0x20];
++static int s_raster_cg_next;
++static uint16_t s_raster_live_cgram[0x100]; /* the guest's CGRAM during a render */
+ 
+ /* Only the machine's PPU journals: the debug server and a few tools run
+  * ppu_write on scratch copies. */
+@@ -3359,6 +3377,39 @@ static void raster_snapshot(PpuRasterField *f, const Ppu *ppu) {
+   f->oamCount = 0;
+   f->oamOpen = 0;
+   f->oamDropped = 0;
++  memcpy(f->cgBase, ppu->cgram, sizeof(f->cgBase));
++  f->cgCount = 0;
++  f->cgOpen = 0;
++  f->cgDropped = 0;
++}
++
++static void raster_cg_close(PpuRasterField *f, const Ppu *ppu) {
++  if (!f->cgOpen) return;
++  memcpy(f->cgSnap[f->cgCount - 1].cgram, ppu->cgram, sizeof(ppu->cgram));
++  f->cgOpen = 0;
++}
++
++/* Called before every CGDATA write, like raster_oam_note_write. */
++static void raster_cg_note_write(Ppu *ppu) {
++  PpuRasterField *f;
++  uint16_t key;
++  if (s_guest_scope) return;
++  if (!s_raster_armed || s_raster_rendering || ppu != raster_machine_ppu())
++    return;
++  if (g_ppu_wlog_src == kPpuWlogReplay || g_ppu_wlog_src == kPpuWlogHdma)
++    return;
++  f = &s_field[s_raster_cur];
++  key = raster_key(raster_write_line());
++  if (f->cgOpen && f->cgSnap[f->cgCount - 1].key == key)
++    return;
++  raster_cg_close(f, ppu);
++  if (f->cgCount >= PPU_RASTER_CG_MAX) {
++    f->cgDropped++;
++    f->cgSnap[f->cgCount - 1].key = key;
++  } else {
++    f->cgSnap[f->cgCount++].key = key;
++  }
++  f->cgOpen = 1;
+ }
+ 
+ /* The snapshot being filled holds whatever the guest has written since it
+@@ -3417,6 +3468,7 @@ void ppu_rasterFieldBoundary(void) {
+     return;
+   s_raster_rendering = 0;
+   raster_oam_close(&s_field[s_raster_cur], ppu);
++  raster_cg_close(&s_field[s_raster_cur], ppu);
+   s_raster_cur ^= 1;
+   s_raster_have_completed = 1;
+   raster_snapshot(&s_field[s_raster_cur], ppu);
+@@ -3495,6 +3547,10 @@ void ppu_rasterRenderBegin(Ppu *ppu) {
+       break;
+     }
+   }
++  memcpy(s_raster_live_cgram, ppu->cgram, sizeof(s_raster_live_cgram));
++  s_raster_cg_next = 0;
++  if (f->cgCount)
++    memcpy(ppu->cgram, f->cgBase, sizeof(f->cgBase));
+   s_raster_render = f;
+   s_raster_next = 0;
+   s_raster_hdmaen_pending = 0;
+@@ -3538,6 +3594,11 @@ void ppu_rasterApplyLine(Ppu *ppu, int line) {
+     memcpy(ppu->oam, s->oam, sizeof(s->oam));
+     memcpy(ppu->highOam, s->highOam, sizeof(s->highOam));
+   }
++  while (s_raster_cg_next < f->cgCount &&
++         f->cgSnap[s_raster_cg_next].key <= limit) {
++    const PpuRasterCg *s = &f->cgSnap[s_raster_cg_next++];
++    memcpy(ppu->cgram, s->cgram, sizeof(s->cgram));
++  }
+ }
+ 
+ /* The render reconstructed the completed field. Writes the guest has made
+@@ -3562,6 +3623,7 @@ void ppu_rasterRenderEnd(Ppu *ppu) {
+   ppu->oamBuffer = s_raster_port.oamBuffer;
+   memcpy(ppu->oam, s_raster_live_oam, sizeof(s_raster_live_oam));
+   memcpy(ppu->highOam, s_raster_live_high_oam, sizeof(s_raster_live_high_oam));
++  memcpy(ppu->cgram, s_raster_live_cgram, sizeof(s_raster_live_cgram));
+ }
+ 
+ /* Snapshot of the journal as the renderer will consume it, for the debug
+@@ -3787,6 +3849,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+       ppu->cgramSecondWrite = false;
+       break;
+     case 0x22:
++      raster_cg_note_write(ppu);
+       if(!ppu->cgramSecondWrite) {
+         ppu->cgramBuffer = val;
+       } else {
